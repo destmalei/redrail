@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 # --- Environment & Storage Configuration ---
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("BOTTOKEN")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # Authorized Admin Chat ID
+ADMINCHAT_ID = os.getenv("ADMIN_CHAT_ID")  # Authorized Admin Chat ID
 
 # Persistent directory for Railway volumes or local testing
 DATA_DIR = os.getenv("DATA_DIR", "data")
