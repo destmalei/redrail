@@ -7,169 +7,182 @@ import os
 import json
 from dotenv import load_dotenv
 
+# --- Environment & Storage Configuration ---
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("BOTTOKEN")
-TELEGRAM_CHAT_ID = None
-SUBS_FILE = "tracked_subs.json"
-KEYS_FILE = "tracked_keys.json"
 
-def load_subs():
-    if os.path.exists(SUBS_FILE):
+# Persistent directory for Railway volumes or local testing
+DATA_DIR = os.getenv("DATA_DIR", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+DATA_FILE = os.path.join(DATA_DIR, "tracked_users.json")
+
+HEADERS = {"User-Agent": "python:telegram-reddit-monitor:v2.0 (by /u/your_username)"}
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+# --- Multi-User Data Management ---
+def load_user_data():
+    if os.path.exists(DATA_FILE):
         try:
-            with open(SUBS_FILE, "r") as f:
-                return set(json.load(f))
-        except Exception:
-            pass
-    return {"hardwareswap"}
+            with open(DATA_FILE, "r") as f:
+                raw_data = json.load(f)
+                # Convert stored lists back into sets for O(1) lookups
+                return {
+                    str(chat_id): {
+                        "subs": set(data.get("subs", ["hardwareswap"])),
+                        "keys": set(data.get("keys", []))
+                    }
+                    for chat_id, data in raw_data.items()
+                }
+        except Exception as e:
+            print(f"Error loading persistent data: {e}")
+    return {}
 
-def save_subs():
-    with open(SUBS_FILE, "w") as f:
-        json.dump(list(TRACKED_SUBS), f)
+def save_user_data():
+    try:
+        serializable_data = {
+            chat_id: {
+                "subs": list(data["subs"]),
+                "keys": list(data["keys"])
+            }
+            for chat_id, data in USER_DATA.items()
+        }
+        with open(DATA_FILE, "w") as f:
+            json.dump(serializable_data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving user data: {e}")
 
-def load_keys():
-    if os.path.exists(KEYS_FILE):
-        try:
-            with open(KEYS_FILE, "r") as f:
-                return set(json.load(f))
-        except Exception:
-            pass
-    return {"ddr5", "3090", "5800x"}  # Default fallback hardware targets
-
-def save_keys():
-    with open(KEYS_FILE, "w") as f:
-        json.dump(list(TRACKED_KEYS), f)
-
-# State variables
-TRACKED_SUBS = load_subs() 
-TRACKED_KEYS = load_keys()
+USER_DATA = load_user_data()
 initialized_subs = set()
 seen_posts = set()
 bot_start_time = time.time()
 
-HEADERS = {"User-Agent": "python:telegram-reddit-monitor:v1.0 (by /u/your_username)"}
+def get_user_config(chat_id):
+    chat_id_str = str(chat_id)
+    if chat_id_str not in USER_DATA:
+        USER_DATA[chat_id_str] = {
+            "subs": {"hardwareswap"},
+            "keys": set()
+        }
+        save_user_data()
+    return USER_DATA[chat_id_str]
 
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-
+# --- Telegram Command Handlers ---
 @bot.message_handler(commands=["status"])
 def send_status(message):
-    global TELEGRAM_CHAT_ID
-    TELEGRAM_CHAT_ID = message.chat.id
+    user = get_user_config(message.chat.id)
 
     uptime_seconds = int(time.time() - bot_start_time)
     hours, remainder = divmod(uptime_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     
-    subs_list = ", ".join([f"r/{sub}" for sub in TRACKED_SUBS]) if TRACKED_SUBS else "None"
-    keys_list = ", ".join(TRACKED_KEYS) if TRACKED_KEYS else "None (Alerting on ALL posts)"
+    subs_list = ", ".join([f"r/{sub}" for sub in user["subs"]]) if user["subs"] else "None"
+    keys_list = ", ".join(user["keys"]) if user["keys"] else "None (Alerting on ALL posts)"
 
     status_text = (
         f"🟢 *Bot Status: ONLINE*\n\n"
         f"⏱️ *Uptime:* {hours}h {minutes}m {seconds}s\n"
-        f"📌 *Tracked Posts:* {len(seen_posts)}\n"
-        f"📁 *Tracked Subs:* {subs_list}\n"
-        f"🔑 *Tracked Keys:* {keys_list}\n"
+        f"👤 *Your Chat ID:* `{message.chat.id}`\n"
+        f"📁 *Your Tracked Subs:* {subs_list}\n"
+        f"🔑 *Your Tracked Keys:* {keys_list}\n"
     )
     bot.reply_to(message, status_text, parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["addsub"])
 def add_subreddit(message):
-    global TELEGRAM_CHAT_ID
-    TELEGRAM_CHAT_ID = message.chat.id
+    user = get_user_config(message.chat.id)
     parts = message.text.split()
     if len(parts) < 2:
-        bot.reply_to(message, "⚠️ *Usage:* `/addsub r/subname` or `/addsub subname`", parse_mode="Markdown")
+        bot.reply_to(message, "⚠️ *Usage:* `/addsub subname`", parse_mode="Markdown")
         return
     
     new_sub = parts[1].strip().lower().replace("r/", "").replace("/", "")
-    if new_sub in TRACKED_SUBS:
-        bot.reply_to(message, f"ℹ️ Already tracking *r/{new_sub}*", parse_mode="Markdown")
+    if new_sub in user["subs"]:
+        bot.reply_to(message, f"ℹ️ You are already tracking *r/{new_sub}*", parse_mode="Markdown")
     else:
-        TRACKED_SUBS.add(new_sub)
-        save_subs()
-        bot.reply_to(message, f"✅ Successfully added! Now tracking *r/{new_sub}*.", parse_mode="Markdown")
+        user["subs"].add(new_sub)
+        save_user_data()
+        bot.reply_to(message, f"✅ Successfully added! Now tracking *r/{new_sub}* for your chat.", parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["removesub"])
 def remove_subreddit(message):
-    global TELEGRAM_CHAT_ID
-    TELEGRAM_CHAT_ID = message.chat.id
+    user = get_user_config(message.chat.id)
     parts = message.text.split()
     if len(parts) < 2:
         bot.reply_to(message, "⚠️ *Usage:* `/removesub subname`", parse_mode="Markdown")
         return
     
     sub_to_remove = parts[1].strip().lower().replace("r/", "").replace("/", "")
-    if sub_to_remove in TRACKED_SUBS:
-        TRACKED_SUBS.remove(sub_to_remove)
-        save_subs()
-        if sub_to_remove in initialized_subs:
-            initialized_subs.remove(sub_to_remove)
-        bot.reply_to(message, f"✅ Successfully removed *r/{sub_to_remove}*.", parse_mode="Markdown")
+    if sub_to_remove in user["subs"]:
+        user["subs"].remove(sub_to_remove)
+        save_user_data()
+        bot.reply_to(message, f"✅ Removed *r/{sub_to_remove}* from your tracked subreddits.", parse_mode="Markdown")
     else:
         bot.reply_to(message, f"ℹ️ You are not currently tracking *r/{sub_to_remove}*.", parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["addkey"])
 def add_keyword(message):
-    global TELEGRAM_CHAT_ID
-    TELEGRAM_CHAT_ID = message.chat.id
-    # Use split to allow multi-word keywords if needed, but grab everything after the command
+    user = get_user_config(message.chat.id)
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         bot.reply_to(message, "⚠️ *Usage:* `/addkey ddr5` or `/addkey 3090`", parse_mode="Markdown")
         return
     
     new_key = parts[1].strip().lower()
-    if new_key in TRACKED_KEYS:
-        bot.reply_to(message, f"ℹ️ Already filtering for *{new_key}*", parse_mode="Markdown")
+    if new_key in user["keys"]:
+        bot.reply_to(message, f"ℹ️ You are already filtering for *{new_key}*", parse_mode="Markdown")
     else:
-        TRACKED_KEYS.add(new_key)
-        save_keys()
-        bot.reply_to(message, f"✅ Successfully added! Bot will now look for *{new_key}*.", parse_mode="Markdown")
+        user["keys"].add(new_key)
+        save_user_data()
+        bot.reply_to(message, f"✅ Added *{new_key}* to your private filter list.", parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["remkey"])
 def remove_keyword(message):
-    global TELEGRAM_CHAT_ID
-    TELEGRAM_CHAT_ID = message.chat.id
+    user = get_user_config(message.chat.id)
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         bot.reply_to(message, "⚠️ *Usage:* `/remkey ddr5`", parse_mode="Markdown")
         return
     
     key_to_remove = parts[1].strip().lower()
-    if key_to_remove in TRACKED_KEYS:
-        TRACKED_KEYS.remove(key_to_remove)
-        save_keys()
-        if not TRACKED_KEYS:
-            bot.reply_to(message, f"✅ Removed *{key_to_remove}*.\n\n_Keyword list is empty! Reverting to alerting on ALL valid selling posts._", parse_mode="Markdown")
+    if key_to_remove in user["keys"]:
+        user["keys"].remove(key_to_remove)
+        save_user_data()
+        if not user["keys"]:
+            bot.reply_to(message, f"✅ Removed *{key_to_remove}*.\n\n_Your keyword list is now empty! You will receive alerts for ALL posts on your subreddits._", parse_mode="Markdown")
         else:
-            bot.reply_to(message, f"✅ Removed *{key_to_remove}*.", parse_mode="Markdown")
+            bot.reply_to(message, f"✅ Removed *{key_to_remove}* from your filters.", parse_mode="Markdown")
     else:
         bot.reply_to(message, f"ℹ️ You are not currently tracking *{key_to_remove}*.", parse_mode="Markdown")
 
 
-def send_telegram_alert(sub, title, link):
-    if not TELEGRAM_CHAT_ID:
-        return
+# --- Reddit Monitor Engine ---
+def send_telegram_alert(chat_id, sub, title, link):
     text = f"🚨 New on r/{sub}\n\n📌 {title}\n🔗 {link}"
     try:
-        bot.send_message(TELEGRAM_CHAT_ID, text, disable_web_page_preview=False, timeout=45)
+        bot.send_message(chat_id, text, disable_web_page_preview=False, timeout=45)
     except Exception as e:
-        print(f"Failed to send Telegram message: {e}")
+        print(f"Failed to send alert to chat {chat_id}: {e}")
 
 
 def monitor_reddit_feed():
-    print("Started Reddit RSS monitor...")
+    print("Started multi-user Reddit RSS monitor...")
     
     while True:
-        if not TRACKED_SUBS:
+        # Collect union of all subreddits requested by active users
+        active_subs = set()
+        for user in USER_DATA.values():
+            active_subs.update(user["subs"])
+
+        if not active_subs:
             time.sleep(10)
             continue
             
-        for sub in list(TRACKED_SUBS):
+        for sub in list(active_subs):
             url = f"https://www.reddit.com/r/{sub}/new.rss"
             try:
                 response = requests.get(url, headers=HEADERS, timeout=10)
@@ -181,34 +194,40 @@ def monitor_reddit_feed():
                         post_id = entry.id
                         if post_id not in seen_posts:
                             seen_posts.add(post_id)
+                            
+                            # Do not fire alerts on historical posts when starting up
                             if not is_first_run:
                                 title_lower = entry.title.lower()
-                                should_alert = False
                                 
-                                # 1. Baseline filtering (e.g. check [H] vs [W] on hardwareswap)
+                                # General selling filter for r/hardwareswap
+                                is_selling_post = True
                                 if sub == "hardwareswap":
                                     if "[h]" in title_lower and "[w]" in title_lower:
                                         h_index = title_lower.find("[h]")
                                         w_index = title_lower.find("[w]")
                                         h_section = title_lower[h_index:w_index]
-                                        
-                                        if not ("paypal" in h_section or "cash" in h_section):
-                                            should_alert = True
-                                else:
-                                    should_alert = True 
+                                        if "paypal" in h_section or "cash" in h_section:
+                                            is_selling_post = False
                                 
-                                # 2. Keyword filtering layer
-                                if should_alert and TRACKED_KEYS:
-                                    # Only alert if ANY of our tracked keys are found in the post title
-                                    if not any(key in title_lower for key in TRACKED_KEYS):
-                                        should_alert = False
-                                    
-                                if should_alert:
-                                    send_telegram_alert(sub, entry.title, entry.link)
+                                if not is_selling_post:
+                                    continue
+
+                                # Dispatch alerts to matching users
+                                for chat_id_str, user_config in USER_DATA.items():
+                                    if sub in user_config["subs"]:
+                                        user_keys = user_config["keys"]
+                                        
+                                        # If user defined custom keywords, check for a match
+                                        if user_keys:
+                                            if any(k in title_lower for k in user_keys):
+                                                send_telegram_alert(chat_id_str, sub, entry.title, entry.link)
+                                        else:
+                                            # No keywords set: send all valid selling posts
+                                            send_telegram_alert(chat_id_str, sub, entry.title, entry.link)
 
                     if is_first_run:
                         initialized_subs.add(sub)
-                        print(f"Initialized r/{sub}, caught up silently.")
+                        print(f"Initialized r/{sub} feed silently.")
                         
                 else:
                     print(f"Failed to fetch r/{sub}. HTTP Status: {response.status_code}")
@@ -230,11 +249,11 @@ if __name__ == "__main__":
 
         try:
             bot.set_my_commands([
-                telebot.types.BotCommand("/status", "Check bot status and uptime"),
-                telebot.types.BotCommand("/addsub", "Add a subreddit"),
-                telebot.types.BotCommand("/removesub", "Remove a subreddit"),
-                telebot.types.BotCommand("/addkey", "Add hardware keyword"),
-                telebot.types.BotCommand("/remkey", "Remove hardware keyword")
+                telebot.types.BotCommand("/status", "Check your status and uptime"),
+                telebot.types.BotCommand("/addsub", "Add a subreddit to your list"),
+                telebot.types.BotCommand("/removesub", "Remove a subreddit from your list"),
+                telebot.types.BotCommand("/addkey", "Add hardware keyword filter"),
+                telebot.types.BotCommand("/remkey", "Remove hardware keyword filter")
             ])
         except Exception as e:
             print(f"Failed to set bot commands: {e}")
