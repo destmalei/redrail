@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 # --- Environment & Storage Configuration ---
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("BOTTOKEN")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # Authorized Admin Chat ID
 
 # Persistent directory for Railway volumes or local testing
 DATA_DIR = os.getenv("DATA_DIR", "data")
@@ -25,7 +26,6 @@ def load_user_data():
         try:
             with open(DATA_FILE, "r") as f:
                 raw_data = json.load(f)
-                # Convert stored lists back into sets for O(1) lookups
                 return {
                     str(chat_id): {
                         "subs": set(data.get("subs", ["hardwareswap"])),
@@ -67,7 +67,47 @@ def get_user_config(chat_id):
     return USER_DATA[chat_id_str]
 
 
-# --- Telegram Command Handlers ---
+# --- Admin Command Handlers ---
+@bot.message_handler(commands=["removechat"])
+def admin_remove_chat(message):
+    if str(message.chat.id) != str(ADMIN_CHAT_ID):
+        bot.reply_to(message, "⛔ *Unauthorized:* You do not have admin permissions.", parse_mode="Markdown")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "⚠️ *Usage:* `/removechat <chat_id>`", parse_mode="Markdown")
+        return
+
+    target_chat_id = parts[1].strip()
+    if target_chat_id in USER_DATA:
+        del USER_DATA[target_chat_id]
+        save_user_data()
+        bot.reply_to(message, f"✅ Successfully removed chat ID `{target_chat_id}` from the database.", parse_mode="Markdown")
+    else:
+        bot.reply_to(message, f"ℹ️ Chat ID `{target_chat_id}` was not found.", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["listchats"])
+def admin_list_chats(message):
+    if str(message.chat.id) != str(ADMIN_CHAT_ID):
+        bot.reply_to(message, "⛔ *Unauthorized:* You do not have admin permissions.", parse_mode="Markdown")
+        return
+
+    if not USER_DATA:
+        bot.reply_to(message, "ℹ️ No registered chats found.", parse_mode="Markdown")
+        return
+
+    report = "📋 *Registered Chat IDs:*\n\n"
+    for cid, config in USER_DATA.items():
+        subs = ", ".join(config['subs']) if config['subs'] else "None"
+        keys = ", ".join(config['keys']) if config['keys'] else "All Posts"
+        report += f"• `{cid}`\n  └ Subs: {subs}\n  └ Keys: {keys}\n\n"
+
+    bot.reply_to(message, report, parse_mode="Markdown")
+
+
+# --- Standard User Command Handlers ---
 @bot.message_handler(commands=["status"])
 def send_status(message):
     user = get_user_config(message.chat.id)
@@ -103,7 +143,7 @@ def add_subreddit(message):
     else:
         user["subs"].add(new_sub)
         save_user_data()
-        bot.reply_to(message, f"✅ Successfully added! Now tracking *r/{new_sub}* for your chat.", parse_mode="Markdown")
+        bot.reply_to(message, f"✅ Successfully added! Now tracking *r/{new_sub}*.", parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["removesub"])
@@ -118,7 +158,7 @@ def remove_subreddit(message):
     if sub_to_remove in user["subs"]:
         user["subs"].remove(sub_to_remove)
         save_user_data()
-        bot.reply_to(message, f"✅ Removed *r/{sub_to_remove}* from your tracked subreddits.", parse_mode="Markdown")
+        bot.reply_to(message, f"✅ Removed *r/{sub_to_remove}*.", parse_mode="Markdown")
     else:
         bot.reply_to(message, f"ℹ️ You are not currently tracking *r/{sub_to_remove}*.", parse_mode="Markdown")
 
@@ -137,7 +177,7 @@ def add_keyword(message):
     else:
         user["keys"].add(new_key)
         save_user_data()
-        bot.reply_to(message, f"✅ Added *{new_key}* to your private filter list.", parse_mode="Markdown")
+        bot.reply_to(message, f"✅ Added *{new_key}* to your filters.", parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["remkey"])
@@ -152,10 +192,7 @@ def remove_keyword(message):
     if key_to_remove in user["keys"]:
         user["keys"].remove(key_to_remove)
         save_user_data()
-        if not user["keys"]:
-            bot.reply_to(message, f"✅ Removed *{key_to_remove}*.\n\n_Your keyword list is now empty! You will receive alerts for ALL posts on your subreddits._", parse_mode="Markdown")
-        else:
-            bot.reply_to(message, f"✅ Removed *{key_to_remove}* from your filters.", parse_mode="Markdown")
+        bot.reply_to(message, f"✅ Removed *{key_to_remove}*.", parse_mode="Markdown")
     else:
         bot.reply_to(message, f"ℹ️ You are not currently tracking *{key_to_remove}*.", parse_mode="Markdown")
 
@@ -173,7 +210,6 @@ def monitor_reddit_feed():
     print("Started multi-user Reddit RSS monitor...")
     
     while True:
-        # Collect union of all subreddits requested by active users
         active_subs = set()
         for user in USER_DATA.values():
             active_subs.update(user["subs"])
@@ -186,6 +222,14 @@ def monitor_reddit_feed():
             url = f"https://www.reddit.com/r/{sub}/new.rss"
             try:
                 response = requests.get(url, headers=HEADERS, timeout=10)
+                
+                # Handling HTTP 429 Rate Limiting
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", 120))
+                    print(f"⚠️ [Rate Limit] HTTP 429 on r/{sub}. Backing off for {retry_after}s...")
+                    time.sleep(retry_after)
+                    continue
+
                 if response.status_code == 200:
                     feed = feedparser.parse(response.content)
                     is_first_run = sub not in initialized_subs
@@ -195,12 +239,10 @@ def monitor_reddit_feed():
                         if post_id not in seen_posts:
                             seen_posts.add(post_id)
                             
-                            # Do not fire alerts on historical posts when starting up
                             if not is_first_run:
                                 title_lower = entry.title.lower()
-                                
-                                # General selling filter for r/hardwareswap
                                 is_selling_post = True
+                                
                                 if sub == "hardwareswap":
                                     if "[h]" in title_lower and "[w]" in title_lower:
                                         h_index = title_lower.find("[h]")
@@ -212,17 +254,13 @@ def monitor_reddit_feed():
                                 if not is_selling_post:
                                     continue
 
-                                # Dispatch alerts to matching users
                                 for chat_id_str, user_config in USER_DATA.items():
                                     if sub in user_config["subs"]:
                                         user_keys = user_config["keys"]
-                                        
-                                        # If user defined custom keywords, check for a match
                                         if user_keys:
                                             if any(k in title_lower for k in user_keys):
                                                 send_telegram_alert(chat_id_str, sub, entry.title, entry.link)
                                         else:
-                                            # No keywords set: send all valid selling posts
                                             send_telegram_alert(chat_id_str, sub, entry.title, entry.link)
 
                     if is_first_run:
@@ -235,9 +273,9 @@ def monitor_reddit_feed():
             except Exception as e:
                 print(f"Error checking feed for r/{sub}: {e}")
 
-            time.sleep(2) 
+            time.sleep(3) 
 
-        time.sleep(60)
+        time.sleep(90)
 
 
 if __name__ == "__main__":
